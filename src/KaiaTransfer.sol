@@ -21,6 +21,30 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
     mapping(address operator => mapping(bytes16 id => bool))
         private processedTransferIntents;
 
+    Permit2 public immutable permit2;
+    IWrappedNativeCurrency private immutable wrappedNativeCurrency;
+
+    constructor(
+        Permit2 _permit2,
+        address _initialOperator,
+        address _initialFeeDestination,
+        IWrappedNativeCurrency _wrappedNativeCurrency
+    ) {
+        require(
+            address(_uniswap) != address(0) &&
+                address(_permit2) != address(0) &&
+                address(_wrappedNativeCurrency) != address(0) &&
+                _initialOperator != address(0) &&
+                _initialFeeDestination != address(0),
+            "invalid constructor parameters"
+        );
+        uniswap = _uniswap;
+        permit2 = _permit2;
+        wrappedNativeCurrency = _wrappedNativeCurrency;
+
+        // Sets an initial operator to enable immediate payment processing
+        feeDestinations[_initialOperator] = _initialFeeDestination;
+    }
 
     ////////////////////////////////////////////////////////////////////////////// 
                                 MODIFIERS
@@ -110,6 +134,55 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
         );
     }
 
+    function transferFundsToDestinations(TransferIntent calldata _intent) internal {
+        if (_intent.recipientCurrency == NATIVE_CURRENCY) {
+            if (_intent.recipientAmount > 0) {
+                sendNative(_intent.recipient, _intent.recipientAmount, false);
+            }
+            if (_intent.feeAmount > 0) {
+                sendNative(feeDestinations[_intent.operator], _intent.feeAmount, false);
+            }
+        } else {
+            IERC20 requestedCurrency = IERC20(_intent.recipientCurrency);
+            if (_intent.recipientAmount > 0) {
+                requestedCurrency.safeTransfer(_intent.recipient, _intent.recipientAmount);
+            }
+            if (_intent.feeAmount > 0) {
+                requestedCurrency.safeTransfer(feeDestinations[_intent.operator], _intent.feeAmount);
+            }
+        }
+    }
+
+    function unwrapAndTransferFundsToDestinations(TransferIntent calldata _intent) internal {
+        uint256 amountToWithdraw = _intent.recipientAmount + _intent.feeAmount;
+        if (_intent.recipientCurrency == NATIVE_CURRENCY && amountToWithdraw > 0) {
+            wrappedNativeCurrency.withdraw(amountToWithdraw);
+        }
+        transferFundsToDestinations(_intent);
+    }
+
+    function sendNative(
+        address destination,
+        uint256 amount,
+        bool isRefund
+    ) internal {
+        (bool success, bytes memory data) = payable(destination).call{value: amount}("");
+        if (!success) {
+            revert NativeTransferFailed(destination, amount, isRefund, data);
+        }
+    }
+
+    function revertIfInexactTransfer(
+        uint256 expectedDiff,
+        uint256 balanceBefore,
+        IERC20 token,
+        address target
+    ) internal view {
+        uint256 balanceAfter = token.balanceOf(target);
+        if (balanceAfter - balanceBefore != expectedDiff) {
+            revert InexactTransfer();
+        }
+    }
     ////////////////////////////////////////////////////////////////////////////// 
                                 PAYMENT METHOD
     //////////////////////////////////////////////////////////////////////////////
@@ -180,6 +253,157 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
         succeedPayment(_intent, neededAmount, _intent.recipientCurrency, _msgSender());
     }
 
+    function transferTokenWithApproval(TransferIntent calldata _intent)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        validIntent(_intent, _msgSender())
+        operatorIsRegistered(_intent)
+    {
+        // Make sure the recipient wants a token
+        if (_intent.recipientCurrency == NATIVE_CURRENCY) {
+            revert IncorrectCurrency(_intent.recipientCurrency);
+        }
+
+        // Make sure the payer has enough of the payment token
+        IERC20 erc20 = IERC20(_intent.recipientCurrency);
+        uint256 neededAmount = _intent.recipientAmount + _intent.feeAmount;
+        uint256 payerBalance = erc20.balanceOf(_msgSender());
+        if (payerBalance < neededAmount) {
+            revert InsufficientBalance(neededAmount - payerBalance);
+        }
+
+        // Make sure the payer has approved this contract for a sufficient transfer
+        uint256 allowance = erc20.allowance(_msgSender(), address(this));
+        if (allowance < neededAmount) {
+            revert InsufficientAllowance(neededAmount - allowance);
+        }
+
+        if (neededAmount > 0) {
+            // Record our balance before (most likely zero) to detect fee-on-transfer tokens
+            uint256 balanceBefore = erc20.balanceOf(address(this));
+
+            // Transfer the payment token to this contract
+            erc20.safeTransferFrom(_msgSender(), address(this), neededAmount);
+
+            // Make sure this is not a fee-on-transfer token
+            revertIfInexactTransfer(neededAmount, balanceBefore, erc20, address(this));
+
+            // Complete the payment
+            transferFundsToDestinations(_intent);
+        }
+
+        succeedPayment(_intent, neededAmount, _intent.recipientCurrency, _msgSender());
+    }
+
+    function wrapAndTransfer(TransferIntent calldata _intent)
+        external
+        payable
+        override
+        nonReentrant
+        whenNotPaused
+        validIntent(_intent, _msgSender())
+        operatorIsRegistered(_intent)
+        exactValueSent(_intent)
+    {
+        // Make sure the recipient wants to receive the wrapped native currency
+        if (_intent.recipientCurrency != address(wrappedNativeCurrency)) {
+            revert IncorrectCurrency(NATIVE_CURRENCY);
+        }
+
+        if (msg.value > 0) {
+            // Wrap the sent native currency
+            wrappedNativeCurrency.deposit{value: msg.value}();
+
+            // Complete the payment
+            transferFundsToDestinations(_intent);
+        }
+
+        succeedPayment(_intent, msg.value, NATIVE_CURRENCY, _msgSender());
+    }
+
+    function unwrapAndTransfer(
+        TransferIntent calldata _intent,
+        Permit2SignatureTransferData calldata _signatureTransferData
+    ) external override nonReentrant whenNotPaused validIntent(_intent, _msgSender()) operatorIsRegistered(_intent) {
+        // Make sure the recipient wants the native currency and that the payer is
+        // sending the wrapped native currency
+        if (
+            _intent.recipientCurrency != NATIVE_CURRENCY ||
+            _signatureTransferData.permit.permitted.token != address(wrappedNativeCurrency)
+        ) {
+            revert IncorrectCurrency(_signatureTransferData.permit.permitted.token);
+        }
+
+        // Make sure the payer has enough of the wrapped native currency
+        uint256 neededAmount = _intent.recipientAmount + _intent.feeAmount;
+        uint256 payerBalance = wrappedNativeCurrency.balanceOf(_msgSender());
+        if (payerBalance < neededAmount) {
+            revert InsufficientBalance(neededAmount - payerBalance);
+        }
+
+        if (neededAmount > 0) {
+            // Make sure the payer is transferring the right amount of the wrapped native currency to the contract
+            if (
+                _signatureTransferData.transferDetails.to != address(this) ||
+                _signatureTransferData.transferDetails.requestedAmount != neededAmount
+            ) {
+                revert InvalidTransferDetails();
+            }
+
+            // Transfer the payer's wrapped native currency to the contract
+            permit2.permitTransferFrom(
+                _signatureTransferData.permit,
+                _signatureTransferData.transferDetails,
+                _msgSender(),
+                _signatureTransferData.signature
+            );
+
+            // Complete the payment
+            unwrapAndTransferFundsToDestinations(_intent);
+        }
+
+        succeedPayment(_intent, neededAmount, address(wrappedNativeCurrency), _msgSender());
+    }
+
+        // @dev Unwraps into native token and transfers native token (e.g. ETH) to _intent.recipient.
+    function unwrapAndTransferWithApproval(TransferIntent calldata _intent)
+        external
+        override
+        nonReentrant
+        whenNotPaused
+        validIntent(_intent, _msgSender())
+        operatorIsRegistered(_intent)
+    {
+        // Make sure the recipient wants the native currency
+        if (_intent.recipientCurrency != NATIVE_CURRENCY) {
+            revert IncorrectCurrency(address(wrappedNativeCurrency));
+        }
+
+        // Make sure the payer has enough of the wrapped native currency
+        uint256 neededAmount = _intent.recipientAmount + _intent.feeAmount;
+        uint256 payerBalance = wrappedNativeCurrency.balanceOf(_msgSender());
+        if (payerBalance < neededAmount) {
+            revert InsufficientBalance(neededAmount - payerBalance);
+        }
+
+        // Make sure the payer has approved this contract for a sufficient transfer
+        uint256 allowance = wrappedNativeCurrency.allowance(_msgSender(), address(this));
+        if (allowance < neededAmount) {
+            revert InsufficientAllowance(neededAmount - allowance);
+        }
+
+        if (neededAmount > 0) {
+            // Transfer the payer's wrapped native currency to the contract
+            wrappedNativeCurrency.safeTransferFrom(_msgSender(), address(this), neededAmount);
+
+            // Complete the payment
+            unwrapAndTransferFundsToDestinations(_intent);
+        }
+
+        succeedPayment(_intent, neededAmount, address(wrappedNativeCurrency), _msgSender());
+    }
 
     function registerOperatorWithAddressAsFeeDestination() external {
         feeDestinations[_msgSender()] = _msgSender();
@@ -207,5 +431,9 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
 
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    receive() external payable {
+        require(msg.sender == address(wrappedNativeCurrency), "only payable for unwrapping");
     }
 }
