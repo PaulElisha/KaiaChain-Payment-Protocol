@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.17;
 
-import "@openzeppelin/utils/Context.sol";
-import "@openzeppelin/access/Ownable.sol";
-import "@openzeppelin/token/ERC20/IERC20.sol";
-import "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
+import "@kaia/utils/Context.sol";
+import "@kaia/access/Ownable.sol";
+import "@kaia/token/ERC20/IERC20.sol";
+import "@kaia/token/ERC20/utils/SafeERC20.sol";
 
 error KaiaSweeper__OnlyOwner();
 error KaiaSweeper__ZeroAddress();

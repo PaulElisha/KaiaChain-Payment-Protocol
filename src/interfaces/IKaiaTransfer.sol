@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.17;
+pragma solidity ^0.8.0;
 
 import "permit2/src/interfaces/ISignatureTransfer.sol";
 
@@ -42,7 +42,7 @@ struct EIP2612SignatureTransferData {
 
 // @title Transfers Contract
 // @notice Functions for making checked transfers between accounts
-interface ITransfers {
+interface IKaiaTransfer {
     // @notice Emitted when a transfer is completed
     // @param operator The operator for the transfer intent
     // @param id The ID of the transfer intent

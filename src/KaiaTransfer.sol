@@ -1,58 +1,61 @@
-// SPDX-License-Identifier: SEE LICENSE IN LICENSE
-pragma solidity ^0.8.20;
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
 
-import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
-import '@openzeppelin/contracts/security/Pausable.sol';
-import '@openzeppelin/contracts/security/ReentrancyGuard.sol';
-import '@openzeppelin/contracts/utils/cryptography/ECDSA.sol';
-import '@openzeppelin/contracts/access/Ownable.sol';
-import '@openzeppelin/contracts/utils/Context.sol';
-import './interfaces/IKaiaTransfer.sol';
-import './KaiaSweeper.sol';
-import 'permit2/src/Permit2.sol';
+import "@openzeppelin/token/ERC20/IERC20.sol";
+import "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/utils/Pausable.sol";
+import "@openzeppelin/utils/ReentrancyGuard.sol";
+import "@openzeppelin/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/access/Ownable.sol";
+import "@openzeppelin/utils/Context.sol";
+import "./KaiaSweeper.sol";
+import "../src/interfaces/IKaiaTransfer.sol";
+import "./interfaces/IWrappedNativeCurrency.sol";
 
-contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweeper, IKaiaTransfer {
+contract KaiaTransfer is
+    Context,
+    Ownable,
+    Pausable,
+    ReentrancyGuard,
+    KaiaSweeper,
+    IKaiaTransfer
+{
+    using SafeERC20 for IERC20;
+    using SafeERC20 for IWrappedNativeCurrency;
 
-    address private immutable NATIVE_CURRENCY = KLAY;
+    address private immutable NATIVE_CURRENCY =
+        0x0000000000000000000000000000000000000000;
 
     mapping(address => address) private operatorFeeDest;
 
-    mapping(address operator => mapping(bytes16 id => bool))
+    mapping(address => mapping(bytes16 => bool))
         private processedTransferIntents;
 
-    Permit2 public immutable permit2;
     IWrappedNativeCurrency private immutable wrappedNativeCurrency;
 
     constructor(
-        Permit2 _permit2,
         address _initialOperator,
         address _initialFeeDestination,
         IWrappedNativeCurrency _wrappedNativeCurrency
     ) {
         require(
-            address(_uniswap) != address(0) &&
-                address(_permit2) != address(0) &&
-                address(_wrappedNativeCurrency) != address(0) &&
+            address(_wrappedNativeCurrency) != address(0) &&
                 _initialOperator != address(0) &&
                 _initialFeeDestination != address(0),
             "invalid constructor parameters"
         );
-        uniswap = _uniswap;
-        permit2 = _permit2;
         wrappedNativeCurrency = _wrappedNativeCurrency;
 
         // Sets an initial operator to enable immediate payment processing
         feeDestinations[_initialOperator] = _initialFeeDestination;
     }
 
-    ////////////////////////////////////////////////////////////////////////////// 
-                                MODIFIERS
-    //////////////////////////////////////////////////////////////////////////////
+    // MODIFIERS
 
     modifier operatorIsRegistered(TransferIntent calldata _intent) {
-        if (feeDestinations[_intent.operator] == address(0)) revert OperatorNotRegistered();
-        _;  
+        if (feeDestinations[_intent.operator] == address(0))
+            revert OperatorNotRegistered();
+        _;
     }
 
     modifier exactValueSent(TransferIntent calldata _intent) {
@@ -62,7 +65,6 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
         } else if (msg.value < neededAmount) {
             revert InvalidNativeAmount(-int256(neededAmount - msg.value));
         }
-
         _;
     }
 
@@ -89,7 +91,9 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
             signedMessageHash = ECDSA.toEthSignedMessageHash(hash);
         } else {
             // Use custom message prefix.
-            signedMessageHash = keccak256(abi.encodePacked(_intent.prefix, hash));
+            signedMessageHash = keccak256(
+                abi.encodePacked(_intent.prefix, hash)
+            );
         }
 
         address signer = ECDSA.recover(signedMessageHash, _intent.signature);
@@ -113,81 +117,11 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
         _;
     }
 
-    ////////////////////////////////////////////////////////////////////////////// 
-                                UTILS FUNCTION
-    //////////////////////////////////////////////////////////////////////////////
+    // PAYMENT METHOD
 
-    function succeedPayment(
-        TransferIntent calldata _intent,
-        uint256 spentAmount,
-        address spentCurrency,
-        address sender
-    ) internal {
-        processedTransferIntents[_intent.operator][_intent.id] = true;
-        emit Transferred(
-            _intent.operator,
-            _intent.id,
-            _intent.recipient,
-            sender,
-            spentAmount,
-            spentCurrency
-        );
-    }
-
-    function transferFundsToDestinations(TransferIntent calldata _intent) internal {
-        if (_intent.recipientCurrency == NATIVE_CURRENCY) {
-            if (_intent.recipientAmount > 0) {
-                sendNative(_intent.recipient, _intent.recipientAmount, false);
-            }
-            if (_intent.feeAmount > 0) {
-                sendNative(feeDestinations[_intent.operator], _intent.feeAmount, false);
-            }
-        } else {
-            IERC20 requestedCurrency = IERC20(_intent.recipientCurrency);
-            if (_intent.recipientAmount > 0) {
-                requestedCurrency.safeTransfer(_intent.recipient, _intent.recipientAmount);
-            }
-            if (_intent.feeAmount > 0) {
-                requestedCurrency.safeTransfer(feeDestinations[_intent.operator], _intent.feeAmount);
-            }
-        }
-    }
-
-    function unwrapAndTransferFundsToDestinations(TransferIntent calldata _intent) internal {
-        uint256 amountToWithdraw = _intent.recipientAmount + _intent.feeAmount;
-        if (_intent.recipientCurrency == NATIVE_CURRENCY && amountToWithdraw > 0) {
-            wrappedNativeCurrency.withdraw(amountToWithdraw);
-        }
-        transferFundsToDestinations(_intent);
-    }
-
-    function sendNative(
-        address destination,
-        uint256 amount,
-        bool isRefund
-    ) internal {
-        (bool success, bytes memory data) = payable(destination).call{value: amount}("");
-        if (!success) {
-            revert NativeTransferFailed(destination, amount, isRefund, data);
-        }
-    }
-
-    function revertIfInexactTransfer(
-        uint256 expectedDiff,
-        uint256 balanceBefore,
-        IERC20 token,
-        address target
-    ) internal view {
-        uint256 balanceAfter = token.balanceOf(target);
-        if (balanceAfter - balanceBefore != expectedDiff) {
-            revert InexactTransfer();
-        }
-    }
-    ////////////////////////////////////////////////////////////////////////////// 
-                                PAYMENT METHOD
-    //////////////////////////////////////////////////////////////////////////////
-
-    function transferNative(TransferIntent calldata _intent)
+    function transferNative(
+        TransferIntent calldata _intent
+    )
         external
         payable
         override
@@ -198,7 +132,8 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
         exactValueSent(_intent)
     {
         // Make sure the recipient wants the native currency
-        if (_intent.recipientCurrency != NATIVE_CURRENCY) revert IncorrectCurrency(NATIVE_CURRENCY);
+        if (_intent.recipientCurrency != NATIVE_CURRENCY)
+            revert IncorrectCurrency(NATIVE_CURRENCY);
 
         if (msg.value > 0) {
             // Complete the payment
@@ -208,52 +143,9 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
         succeedPayment(_intent, msg.value, NATIVE_CURRENCY, _msgSender());
     }
 
-    function transferToken(
-        TransferIntent calldata _intent,
-        Permit2SignatureTransferData calldata _signatureTransferData
-    ) external override nonReentrant whenNotPaused validIntent(_intent, _msgSender()) operatorIsRegistered(_intent) {
-
-        if (
-            _intent.recipientCurrency == NATIVE_CURRENCY ||
-            _signatureTransferData.permit.permitted.token != _intent.recipientCurrency
-        ) {
-            revert IncorrectCurrency(_signatureTransferData.permit.permitted.token);
-        }
-
-        IERC20 erc20 = IERC20(_intent.recipientCurrency);
-        uint256 neededAmount = _intent.recipientAmount + _intent.feeAmount;
-        uint256 payerBalance = erc20.balanceOf(_msgSender());
-        if (payerBalance < neededAmount) {
-            revert InsufficientBalance(neededAmount - payerBalance);
-        }
-
-        if (neededAmount > 0) {
-
-            if (
-                _signatureTransferData.transferDetails.to != address(this) ||
-                _signatureTransferData.transferDetails.requestedAmount != neededAmount
-            ) {
-                revert InvalidTransferDetails();
-            }
-
-            uint256 balanceBefore = erc20.balanceOf(address(this));
-
-            permit2.permitTransferFrom(
-                _signatureTransferData.permit,
-                _signatureTransferData.transferDetails,
-                _msgSender(),
-                _signatureTransferData.signature
-            );
-
-            revertIfInexactTransfer(neededAmount, balanceBefore, erc20, address(this));
-
-            transferFundsToDestinations(_intent);
-        }
-
-        succeedPayment(_intent, neededAmount, _intent.recipientCurrency, _msgSender());
-    }
-
-    function transferTokenWithApproval(TransferIntent calldata _intent)
+    function transferTokenWithApproval(
+        TransferIntent calldata _intent
+    )
         external
         override
         nonReentrant
@@ -288,16 +180,28 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
             erc20.safeTransferFrom(_msgSender(), address(this), neededAmount);
 
             // Make sure this is not a fee-on-transfer token
-            revertIfInexactTransfer(neededAmount, balanceBefore, erc20, address(this));
+            revertIfInexactTransfer(
+                neededAmount,
+                balanceBefore,
+                erc20,
+                address(this)
+            );
 
             // Complete the payment
             transferFundsToDestinations(_intent);
         }
 
-        succeedPayment(_intent, neededAmount, _intent.recipientCurrency, _msgSender());
+        succeedPayment(
+            _intent,
+            neededAmount,
+            _intent.recipientCurrency,
+            _msgSender()
+        );
     }
 
-    function wrapAndTransfer(TransferIntent calldata _intent)
+    function wrapAndTransfer(
+        TransferIntent calldata _intent
+    )
         external
         payable
         override
@@ -323,52 +227,10 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
         succeedPayment(_intent, msg.value, NATIVE_CURRENCY, _msgSender());
     }
 
-    function unwrapAndTransfer(
-        TransferIntent calldata _intent,
-        Permit2SignatureTransferData calldata _signatureTransferData
-    ) external override nonReentrant whenNotPaused validIntent(_intent, _msgSender()) operatorIsRegistered(_intent) {
-        // Make sure the recipient wants the native currency and that the payer is
-        // sending the wrapped native currency
-        if (
-            _intent.recipientCurrency != NATIVE_CURRENCY ||
-            _signatureTransferData.permit.permitted.token != address(wrappedNativeCurrency)
-        ) {
-            revert IncorrectCurrency(_signatureTransferData.permit.permitted.token);
-        }
-
-        // Make sure the payer has enough of the wrapped native currency
-        uint256 neededAmount = _intent.recipientAmount + _intent.feeAmount;
-        uint256 payerBalance = wrappedNativeCurrency.balanceOf(_msgSender());
-        if (payerBalance < neededAmount) {
-            revert InsufficientBalance(neededAmount - payerBalance);
-        }
-
-        if (neededAmount > 0) {
-            // Make sure the payer is transferring the right amount of the wrapped native currency to the contract
-            if (
-                _signatureTransferData.transferDetails.to != address(this) ||
-                _signatureTransferData.transferDetails.requestedAmount != neededAmount
-            ) {
-                revert InvalidTransferDetails();
-            }
-
-            // Transfer the payer's wrapped native currency to the contract
-            permit2.permitTransferFrom(
-                _signatureTransferData.permit,
-                _signatureTransferData.transferDetails,
-                _msgSender(),
-                _signatureTransferData.signature
-            );
-
-            // Complete the payment
-            unwrapAndTransferFundsToDestinations(_intent);
-        }
-
-        succeedPayment(_intent, neededAmount, address(wrappedNativeCurrency), _msgSender());
-    }
-
-        // @dev Unwraps into native token and transfers native token (e.g. ETH) to _intent.recipient.
-    function unwrapAndTransferWithApproval(TransferIntent calldata _intent)
+    // @dev Unwraps into native token and transfers native token (e.g. ETH) to _intent.recipient.
+    function unwrapAndTransferWithApproval(
+        TransferIntent calldata _intent
+    )
         external
         override
         nonReentrant
@@ -389,20 +251,32 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
         }
 
         // Make sure the payer has approved this contract for a sufficient transfer
-        uint256 allowance = wrappedNativeCurrency.allowance(_msgSender(), address(this));
+        uint256 allowance = wrappedNativeCurrency.allowance(
+            _msgSender(),
+            address(this)
+        );
         if (allowance < neededAmount) {
             revert InsufficientAllowance(neededAmount - allowance);
         }
 
         if (neededAmount > 0) {
             // Transfer the payer's wrapped native currency to the contract
-            wrappedNativeCurrency.safeTransferFrom(_msgSender(), address(this), neededAmount);
+            wrappedNativeCurrency.safeTransferFrom(
+                _msgSender(),
+                address(this),
+                neededAmount
+            );
 
             // Complete the payment
             unwrapAndTransferFundsToDestinations(_intent);
         }
 
-        succeedPayment(_intent, neededAmount, address(wrappedNativeCurrency), _msgSender());
+        succeedPayment(
+            _intent,
+            neededAmount,
+            address(wrappedNativeCurrency),
+            _msgSender()
+        );
     }
 
     function registerOperatorWithAddressAsFeeDestination() external {
@@ -425,6 +299,93 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
         emit OperatorUnregistered(_msgSender());
     }
 
+    // UTILS FUNCTION
+
+    function succeedPayment(
+        TransferIntent calldata _intent,
+        uint256 spentAmount,
+        address spentCurrency,
+        address sender
+    ) internal {
+        processedTransferIntents[_intent.operator][_intent.id] = true;
+        emit Transferred(
+            _intent.operator,
+            _intent.id,
+            _intent.recipient,
+            sender,
+            spentAmount,
+            spentCurrency
+        );
+    }
+
+    function transferFundsToDestinations(
+        TransferIntent calldata _intent
+    ) internal {
+        if (_intent.recipientCurrency == NATIVE_CURRENCY) {
+            if (_intent.recipientAmount > 0) {
+                sendNative(_intent.recipient, _intent.recipientAmount, false);
+            }
+            if (_intent.feeAmount > 0) {
+                sendNative(
+                    feeDestinations[_intent.operator],
+                    _intent.feeAmount,
+                    false
+                );
+            }
+        } else {
+            IERC20 requestedCurrency = IERC20(_intent.recipientCurrency);
+            if (_intent.recipientAmount > 0) {
+                requestedCurrency.safeTransfer(
+                    _intent.recipient,
+                    _intent.recipientAmount
+                );
+            }
+            if (_intent.feeAmount > 0) {
+                requestedCurrency.safeTransfer(
+                    feeDestinations[_intent.operator],
+                    _intent.feeAmount
+                );
+            }
+        }
+    }
+
+    function unwrapAndTransferFundsToDestinations(
+        TransferIntent calldata _intent
+    ) internal {
+        uint256 amountToWithdraw = _intent.recipientAmount + _intent.feeAmount;
+        if (
+            _intent.recipientCurrency == NATIVE_CURRENCY && amountToWithdraw > 0
+        ) {
+            wrappedNativeCurrency.withdraw(amountToWithdraw);
+        }
+        transferFundsToDestinations(_intent);
+    }
+
+    function sendNative(
+        address destination,
+        uint256 amount,
+        bool isRefund
+    ) internal {
+        (bool success, bytes memory data) = payable(destination).call{
+            value: amount
+        }("");
+        if (!success) {
+            revert NativeTransferFailed(destination, amount, isRefund, data);
+        }
+    }
+
+    function revertIfInexactTransfer(
+        uint256 expectedDiff,
+        uint256 balanceBefore,
+        IERC20 token,
+        address target
+    ) internal view {
+        uint256 balanceAfter = token.balanceOf(target);
+        if (balanceAfter - balanceBefore != expectedDiff) {
+            revert InexactTransfer();
+        }
+    }
+
     function pause() external onlyOwner {
         _pause();
     }
@@ -434,6 +395,9 @@ contract KaiaTransfer is Context, Ownable, Pausable, ReentrancyGuard, KaiaSweepe
     }
 
     receive() external payable {
-        require(msg.sender == address(wrappedNativeCurrency), "only payable for unwrapping");
+        require(
+            msg.sender == address(wrappedNativeCurrency),
+            "only payable for unwrapping"
+        );
     }
 }
